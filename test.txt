@@ -1,0 +1,273 @@
+Ito misy retour chatgpt fa cas burkina : Parfait — on peut bâtir un escrow (compte séquestre) on-chain sur Solana qui couvre vos cas d’usage (B2B, freelances, e-commerce, immobilier, diaspora → mobile money/fiat). Voici un design clair, prêt à implémenter (Anchor), avec options conformité & passerelles fiat.
+
+1) Modèles d’escrow à supporter
+	1.	Escrow simple (2-party + arbitre optionnel)
+      •   Acheteur dépose des fonds (SOL/USDC/“Volanaka” SPL).
+      •   Libération par double-signature (acheteur+vendeur) ou par arbitre en cas de litige.
+      •   Timeout : remboursement automatique à l’acheteur si délai dépassé.
+	2.	Escrow par jalons (milestones)
+      •   N jalons, chaque jalon = sous-compte PDA.
+      •   Libération lot-par-lot (utile pour prestations longues, chantiers, marchés publics).
+	3.	Escrow avec conditions (oracle)
+      •   Déblocage si un oracle atteste d’un évènement (ex : livraison, tracking, signature électronique).
+      •   Compatible QR de réception côté vendeur, ou preuve de signature côté acheteur.
+	4.	Escrow hybride crypto ↔ fiat (Burkina / mobile money)
+      •   On-chain: escrows en USDC/Volanaka.
+      •   Off-chain: opérateur agréé crédite mobile money/compte bancaire lors de la libération (mint/burn de Volanaka vs float MGA).
+
+2) Architecture Solana (Anchor)
+   •   State & comptes
+      •   EscrowVault (PDA): état global d’un contrat d’escrow (parties, devise SPL, montants, frais, dates, statut).
+      •   VaultTokenAccount (PDA): compte token SPL qui détient les fonds séquestrés.
+      •   Milestone (PDA): un par jalon (montant, délai, statut).
+      •   Config (PDA admin): frais plateforme, liste d’arbitres autorisés, allowlist KYC.
+   •   Programmes utilisés
+      •   System Program (création comptes)
+      •   Token Program (SPL) / Associated Token
+      •   (Optionnel) Token-2022 si vous voulez règles supplémentaires (fees, transfer hooks).
+   •   Sécurité
+      •   PDAs pour empêcher toute clé privée d’accéder aux fonds.
+      •   Escrow in-kind (SPL natif — USDC, Volanaka SPL).
+      •   Upgrade authority via multisig + timelock (ou programme gelé après audit).
+
+Schéma d’instructions (résumé)
+   •   initialize_escrow(…) : crée le PDA, paramètre parties, token Mint, délais, arbitre, frais.
+   •   deposit(…) : l’acheteur transfère X tokens vers VaultTokenAccount.
+   •   release(…) : libère vers le vendeur (co-signature ou arbitre).
+   •   refund(…) : rembourse l’acheteur (si timeout ou décision arbitre).
+   •   approve_milestone(i) / refund_milestone(i) : gestion jalon par jalon.
+   •   set_dispute(…) / resolve_dispute(arbiter_decision) : litiges.
+   •   close_if_zero(…) : ménage des comptes.
+
+3) Exemple minimal (Anchor – Rust, SPL)
+
+(extrait simplifié pour montrer la structure ; à adapter)
+
+// Cargo.toml: anchor-lang, anchor-spl = { features = ["token"] }
+
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Mint, Transfer};
+
+declare_id!("Escrow1111111111111111111111111111111111111");
+
+#[program]
+pub mod volanaka_escrow {
+    use super::*;
+
+    pub fn initialize_escrow(
+        ctx: Context<InitializeEscrow>,
+        amount: u64,
+        release_deadline: i64,
+        fee_bps: u16,
+    ) -> Result<()> {
+        let state = &mut ctx.accounts.escrow;
+        state.buyer = ctx.accounts.buyer.key();
+        state.seller = ctx.accounts.seller.key();
+        state.arbiter = ctx.accounts.arbiter.key(); // Option<Pubkey> si vous voulez
+        state.mint = ctx.accounts.mint.key();
+        state.vault = ctx.accounts.vault.key();
+        state.amount = amount;
+        state.released = false;
+        state.refunded = false;
+        state.deadline = release_deadline;
+        state.fee_bps = fee_bps;
+        Ok(())
+    }
+
+    pub fn deposit(ctx: Context<Deposit>) -> Result<()> {
+        let amount = ctx.accounts.escrow.amount;
+        // Transfert de buyer_ata -> vault (PDA)
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.buyer_ata.to_account_info(),
+                    to: ctx.accounts.vault.to_account_info(),
+                    authority: ctx.accounts.buyer.to_account_info(),
+                }
+            ),
+            amount,
+        )?;
+        Ok(())
+    }
+
+    pub fn release(ctx: Context<Release>) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        require!(!escrow.released && !escrow.refunded, CustomError::AlreadyFinalized);
+
+        // Vérifier signatures (buyer + seller) ou arbiter
+        let signer = ctx.accounts.signer.key();
+        require!(
+            signer == escrow.buyer || signer == escrow.seller || signer == escrow.arbiter,
+            CustomError::Unauthorized
+        );
+        // (Option: exiger deux signatures via autres mécanismes)
+
+        // Calcul des frais
+        let fee = escrow.amount * (escrow.fee_bps as u64) / 10_000;
+        let to_seller = escrow.amount - fee;
+
+        // Vault (PDA) -> seller_ata
+        let seeds = &[b"vault", escrow.key().as_ref(), &[ctx.bumps["vault"]]];
+        let signer_seeds = &[&seeds[..]];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.vault.to_account_info(),
+                    to: ctx.accounts.seller_ata.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                signer_seeds
+            ),
+            to_seller,
+        )?;
+
+        // Frais -> fee_ata
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.vault.to_account_info(),
+                    to: ctx.accounts.fee_ata.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                signer_seeds
+            ),
+            fee,
+        )?;
+
+        escrow.released = true;
+        Ok(())
+    }
+
+    pub fn refund(ctx: Context<Refund>) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        require!(!escrow.released && !escrow.refunded, CustomError::AlreadyFinalized);
+
+        // Timeout ou arbitre
+        let now = Clock::get()?.unix_timestamp;
+        let by_arbitrer = ctx.accounts.signer.key() == escrow.arbiter;
+        require!(now > escrow.deadline || by_arbitrer, CustomError::TooEarly);
+
+        let seeds = &[b"vault", escrow.key().as_ref(), &[ctx.bumps["vault"]]];
+        let signer_seeds = &[&seeds[..]];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.vault.to_account_info(),
+                    to: ctx.accounts.buyer_ata.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                signer_seeds
+            ),
+            escrow.amount,
+        )?;
+
+        escrow.refunded = true;
+        Ok(())
+    }
+}
+
+#[account]
+pub struct Escrow {
+    pub buyer: Pubkey,
+    pub seller: Pubkey,
+    pub arbiter: Pubkey,
+    pub mint: Pubkey,
+    pub vault: Pubkey,
+    pub amount: u64,
+    pub deadline: i64,
+    pub fee_bps: u16,
+    pub released: bool,
+    pub refunded: bool,
+}
+
+#[derive(Accounts)]
+pub struct InitializeEscrow<'info> {
+    #[account(init, payer=buyer, space=8+200)]
+    pub escrow: Account<'info, Escrow>,
+    /// CHECK: PDA vault ATA créé séparément (ou utilisez AssociatedToken)
+    #[account(mut)]
+    pub vault: Account<'info, TokenAccount>,
+    pub mint: Account<'info, Mint>,
+    /// Parties
+    #[account(mut)] pub buyer: Signer<'info>,
+    /// CHECK: seller & arbiter peuvent être des Pubkey simples
+    /// …
+    /// Systèmes
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+}
+
+Client (TypeScript, Anchor)
+
+import { PublicKey } from "@solana/web3.js";
+// 1) Créer mint (USDC/Volanaka SPL), ATAs, PDA vault
+// 2) initialize_escrow(...)
+// 3) deposit(...)
+// 4a) release(...)  ou  4b) refund(...)
+
+4) Conformité & gouvernance (Burkina / UEMOA)
+   •   KYC/AML :
+      •   Restreindre l’accès via allowlist on-chain (liste d’adresses vérifiées KYC).
+      •   Plafonds par palier KYC (tiered limits) stockés dans Config.
+      •   Journalisation off-chain (hash on-chain) pour Travel Rule/traçabilité.
+   •   Arbitres agréés :
+      •   Registre d’arbitres (clés publiques) contrôlé par multisig.
+      •   Procédure de résolution des litiges et SLA (off-chain), décision on-chain via resolve_dispute.
+   •   Frais & modèle économique :
+      •   fee_bps (par ex. 50–150 bps) + frais fixe faible.
+      •   Remise grands comptes ; frais additionnels pour escrow par jalons et arbitrage.
+   •   Audit & sécurité :
+      •   Revue externe (Rust/Anchor), tests fuzz, limites de montants, pause switch (emergency stop), monitoring.
+
+5) Intégration “Volanaka” & fiat/mobile money
+   •   Devise on-chain :
+      •   USDC-Solana et Volanaka (SPL) adossé à l’ariary (ou XOF si vous faites un jeton local pour le Burkina).
+   •   Passerelle Off-chain :
+      •   Service “Escrow Bridge” relié aux agrégateurs mobile money/banques.
+      •   À la libération, le programme émet un event (Anchor). Le service indexe l’event et :
+	1.	effectue le paiement mobile money/SEPA,
+	2.	exécute burn de Volanaka côté on-chain (ou débite votre float),
+	3.	met à jour le statut off-chain (preuve/horodatage).
+   •   Kiosques / agents : cash-in/out pour zones peu bancarisées.
+   •   Preuves de livraison : QR signé, géolocalisation optionnelle, signature électronique (si vous déployez votre RA/PSCO).
+
+6) Parcours utilisateurs (exemples)
+
+E-commerce / freelance
+	1.	Acheteur crée l’escrow (montant, délai, arbitre).
+	2.	Dépôt en USDC/Volanaka.
+	3.	Vendeur livre ; acheteur clique “Valider”, on-chain release.
+	4.	Vendeur retire on-chain ou reçoit fiat via bridge.
+
+Immobilier
+   •   Jalons : réservation, compromis, acte. Chaque jalon libère un pourcentage. Arbitre = notaire/mandataire.
+
+Marchés publics / B2B
+   •   Escrow jalonné + oracle (reception report). Rapports signés électroniquement.
+
+7) Points clés produit & GTM Burkina
+   •   Proposition de valeur : alternative digitale au chèque certifié ; plus rapide, traçable, compatible mobile money.
+   •   Segments : marketplaces, freelances, PME import/export, immobilier, administrations (cautions/jalons).
+   •   Tarifs indicatifs : 0,8%–1,5% (décroissant), min 0,50–1,00 € ; +0,2–0,4% si arbitrage.
+   •   Partenariats : banques locales (comptes de cantonnement), MNO (mobile money), notaires/huissiers (arbitrage), intégrateurs e-commerce.
+   •   Conformité locale : valider avec la banque centrale (BCEAO) / droit OHADA pour la qualification du séquestre et statut de l’opérateur.
+
+😎 Roadmap technique (rapide)
+
+S1:
+   •   MVP escrow simple (USDC/Volanaka), timeout, arbitre, frais.
+   •   Back-office admin (multisig), webhook d’events.
+   •   Intégration premier MNO (payout).
+S2:
+   •   Jalons + oracle, SDK JS/Flutter, tableaux de bord, KYC tiers.
+   •   Audit, bug bounty, gel du programme.
+S3:
+   •   Produits avancés (lettre de garantie tokenisée, dépôt de garantie locatif, factures supply-chain), multi-région.
+
+⸻
+
+Si tu veux, je te fournis un repo Anchor minimal (programme + tests + client TypeScript), et un schéma d’API pour la passerelle mobile-money (webhooks/events).
