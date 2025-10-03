@@ -1,0 +1,45 @@
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Mint, Transfer};
+
+
+declare_id!("Dyzh44sBUJYppZctNY1fbi25YL39PSiekUVqJYtc6jgc");
+
+#[program]
+pub mod escrow_volanaka {
+    use super::*;
+
+    pub fn initialize(
+        ctx: Context<InitializeEscrow>,
+        amount: u64,
+        mint: Pubkey,
+    ) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow_account;
+        escrow.seller = ctx.accounts.seller.key();
+        escrow.buyer = ctx.accounts.buyer.key();
+        escrow.amount = amount;
+        escrow.mint = mint;
+        escrow.is_initialized = true;
+        msg!("Escrow initialized between seller: {:?} and buyer: {:?}", escrow.seller, escrow.buyer);
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct InitializeEscrow<'info> {
+    #[account(init, payer = seller, space = 8 + 32 + 32 + 8 + 32 + 1)] 
+    pub escrow_account: Account<'info, EscrowAccount>,
+    #[account(mut)]
+    pub seller: Signer<'info>,
+    /// CHECK: This is safe, buyer will sign later
+    pub buyer: AccountInfo<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[account]
+pub struct EscrowAccount {
+    pub seller: Pubkey,
+    pub buyer: Pubkey,
+    pub amount: u64,
+    pub mint : Pubkey,
+    pub is_initialized: bool,
+}
