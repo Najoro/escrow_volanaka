@@ -5,14 +5,14 @@ package_manager = "yarn"
 resolution = true
 skip-lint = false
 
-[programs.localnet]
+[programs.devnet]
 escrow_volanaka = "Dyzh44sBUJYppZctNY1fbi25YL39PSiekUVqJYtc6jgc"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "localnet"
+cluster = "Devnet"
 wallet = "app/private-keys/eqima.json"
 
 [scripts]
